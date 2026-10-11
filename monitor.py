@@ -1,6 +1,6 @@
 import os, json, urllib.parse, requests, feedparser
 
-KEYWORDS = '"Alpha Tau Medical"', '"Alpha DaRT"', 'DRTS "Alpha Tau"', '"$DRTS"']
+KEYWORDS = ['"Alpha Tau Medical"', '"Alpha DaRT"', 'DRTS "Alpha Tau"', '"$DRTS"']
 SEEN_FILE = "seen.json"
 HEADERS = {"User-Agent": "mention-monitor/1.0 (contact: you@example.com)"}
 
