@@ -18,7 +18,7 @@ SITES = [
     "medtechdive.com", "onclive.com", "targetedonc.com", "globes.co.il",
     "calcalistech.com", "timesofisrael.com", "jpost.com",
 ]
-
+NITTER_HOSTS = []
 MASTODON = ["mastodon.social", "mastodon.online"]
 EXTRA_FEEDS = []
 MAX_SEND = 15
