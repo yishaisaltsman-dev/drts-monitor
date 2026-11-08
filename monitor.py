@@ -1,5 +1,32 @@
 import os, json, re, time, urllib.parse, requests, feedparser
 from concurrent.futures import ThreadPoolExecutor
+import re
+
+STRONG = [
+    r"\$DRTS\b",
+    r"alpha\s+tau\s+medical",
+    r"alpha\s*dart",
+    r"radium\s*224",
+]
+
+CONTEXT = [
+    "nasdaq", "stock", "shares", "tolmar", "pembrolizumab", "keytruda",
+    "glioblastoma", "regain", "restart", "head and neck", "sno",
+    "alpha tau", "radiation", "tumor",
+]
+
+EXCLUDE = [
+]
+
+def is_relevant(text):
+    low = text.lower()
+    if any(x.lower() in low for x in EXCLUDE):
+        return False
+    if any(re.search(p, text, re.I) for p in STRONG):
+        return True
+    if re.search(r"\bDRTS\b", text) and any(c in low for c in CONTEXT):
+        return True
+    return False
 
 # ---------- SETTINGS (edit this block only) ----------
 LABEL = "[DRTS]"
