@@ -1,32 +1,5 @@
 import os, json, re, time, urllib.parse, requests, feedparser
 from concurrent.futures import ThreadPoolExecutor
-import re
-
-STRONG = [
-    r"\$DRTS\b",
-    r"alpha\s+tau\s+medical",
-    r"alpha\s*dart",
-    r"radium\s*224",
-]
-
-CONTEXT = [
-    "nasdaq", "stock", "shares", "tolmar", "pembrolizumab", "keytruda",
-    "glioblastoma", "regain", "restart", "head and neck", "sno",
-    "alpha tau", "radiation", "tumor",
-]
-
-EXCLUDE = [
-]
-
-def is_relevant(text):
-    low = text.lower()
-    if any(x.lower() in low for x in EXCLUDE):
-        return False
-    if any(re.search(p, text, re.I) for p in STRONG):
-        return True
-    if re.search(r"\bDRTS\b", text) and any(c in low for c in CONTEXT):
-        return True
-    return False
 
 # ---------- SETTINGS (edit this block only) ----------
 LABEL = "[DRTS]"
@@ -51,6 +24,42 @@ EXTRA_FEEDS = []
 MAX_SEND = 15
 SEEN_FILE = "seen.json"
 # ---------- END SETTINGS ----------
+
+# ---------- RELEVANCE FILTER ----------
+# Anything containing one of these phrases is dropped. Add noisy phrases here.
+EXCLUDE = [
+]
+
+# These clearly mean your company, so they always pass.
+STRONG = [
+    r"\$DRTS\b",
+    r"alpha[\s\-]*tau\s+medical",
+    r"alpha[\s\-]*darts?\b",
+    r"radium[\s\-]*224",
+    r"אלפא\s*טאו",
+]
+
+# A bare uppercase "DRTS" only passes if one of these words is also present.
+CONTEXT_RE = re.compile(
+    r"\b(nasdaq|stocks?|shares|tolmar|pembrolizumab|keytruda|glioblastoma|regain|"
+    r"restart|head and neck|sno|alpha tau|radiation|tumou?rs?)\b",
+    re.I,
+)
+
+# Sources that are already specific to your company and skip the filter.
+TRUSTED_KINDS = {"trials", "papers"}
+
+
+def is_relevant(text):
+    low = text.lower()
+    if any(x.lower() in low for x in EXCLUDE):
+        return False
+    if any(re.search(p, text, re.I) for p in STRONG):
+        return True
+    if re.search(r"\bDRTS\b", text) and CONTEXT_RE.search(text):
+        return True
+    return False
+# ---------- END RELEVANCE FILTER ----------
 
 HEADERS = {"User-Agent": "mention-monitor/1.0 (contact: yishai.saltsman@gmail.com)"}
 
@@ -161,10 +170,10 @@ def fetch(src):
             feed = feedparser.parse(r.content)
             entries = [(e.get("title", ""), e.get("link", ""), e.get("summary", "")) for e in feed.entries]
         print(r.status_code, len(entries), url[:110])
-        return need_match, entries
+        return need_match, kind, entries
     except Exception as ex:
         print("failed:", url[:110], str(ex)[:80])
-        return need_match, []
+        return need_match, kind, []
 
 
 first_run = not os.path.exists(SEEN_FILE)
@@ -175,16 +184,20 @@ except Exception:
 
 found = []
 batch = set()
+filtered_out = 0
 
 with ThreadPoolExecutor(max_workers=16) as pool:
     results = list(pool.map(fetch, list(sources())))
 
-for need_match, entries in results:
+for need_match, kind, entries in results:
     for title, link, summary in entries:
         if not link:
             continue
         link = re.sub(r"^https?://[^/]*nitter[^/]*/", "https://x.com/", link).replace("#m", "")
         if need_match and not any(t in (title + " " + summary).lower() for t in TERMS):
+            continue
+        if kind not in TRUSTED_KINDS and not is_relevant(title + " " + summary):
+            filtered_out += 1
             continue
         n = norm(title)
         tkey = "t:" + n if n else link
@@ -202,5 +215,6 @@ else:
             seen.update([link, tkey])
         time.sleep(1)
 
+print("filtered as irrelevant:", filtered_out)
 print("new items found:", len(found))
 json.dump(sorted(seen), open(SEEN_FILE, "w"))
