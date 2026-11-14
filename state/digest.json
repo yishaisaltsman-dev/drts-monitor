@@ -5,6 +5,12 @@
   "checked": 0,
   "instant": 0,
   "digest": 0,
-  "errors": {}
+  "errors": {
+   "Reddit [Alpha Tau]": 1,
+   "Reddit [Alpha DaRT]": 1,
+   "Reddit [Alpha Tau Medical]": 1,
+   "Reddit [DRTS stock]": 1,
+   "Reddit [$DRTS]": 1
+  }
  }
 }
