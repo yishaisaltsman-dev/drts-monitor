@@ -1,16 +1,10 @@
 {
  "items": [],
- "last_digest_date": "2026-11-15",
+ "last_digest_date": "2026-11-16",
  "stats": {
-  "checked": 5,
-  "instant": 4,
+  "checked": 0,
+  "instant": 0,
   "digest": 0,
-  "errors": {
-   "Reddit [Alpha Tau]": 4,
-   "Reddit [Alpha DaRT]": 4,
-   "Reddit [Alpha Tau Medical]": 4,
-   "Reddit [DRTS stock]": 4,
-   "Reddit [$DRTS]": 4
-  }
+  "errors": {}
  }
 }
