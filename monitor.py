@@ -1,319 +1,242 @@
+import hashlib
+import json
 import os
 import re
-import json
+import sys
 import time
-from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
-import feedparser
 
-# ------------------------------------------------------------------
-# SECRETS (your repo uses TG_TOKEN and TG_CHAT, other names work too)
-# ------------------------------------------------------------------
-BOT_TOKEN = (
-    os.environ.get("TG_TOKEN")
-    or os.environ.get("TELEGRAM_BOT_TOKEN")
-    or os.environ.get("BOT_TOKEN")
-)
-CHAT_ID = (
-    os.environ.get("TG_CHAT")
-    or os.environ.get("TELEGRAM_CHAT_ID")
-    or os.environ.get("CHAT_ID")
-)
-if not BOT_TOKEN or not CHAT_ID:
-    raise SystemExit(
-        "Missing Telegram token or chat id. Check that the repository secrets "
-        "TG_TOKEN and TG_CHAT exist and that the workflow env block passes them in."
-    )
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SEND_TEST = os.environ.get("SEND_TEST", "").lower() == "true"
+SEEN_FILE = "seen.json"
+MAX_AGE_DAYS = 3
+MAX_ALERTS_PER_RUN = 25
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; drts-monitor/2.0)"}
 
-# ------------------------------------------------------------------
-# SETTINGS
-# ------------------------------------------------------------------
-MAX_AGE_HOURS = 72          # ignore items older than this
-MAX_INSTANT_PER_RUN = 15    # cap on instant alerts per run, overflow goes to the digest
-DIGEST_HOUR_UTC = 6         # daily digest goes out after this UTC hour
-STATE_DIR = "state"
-
-# Tier 1: always sent instantly
-TIER1_PATTERNS = [
-    r"alpha tau(?! omega)",
-    r"alpha[\s\-]?dart",
-    r"alphadart",
-    r"\$drts\b",
-    r"אלפא טאו",
-]
-
-# Phrases removed before matching so they can never trigger anything
-NOISE_PHRASES = [
-    "alpha tau omega",
-]
-
-# Tier 2: bare "drts" is sent instantly only if one of these words is also present
-DRTS_BARE = re.compile(r"\bdrts\b")
-CONTEXT_WORDS = [
-    "stock", "shares", "share price", "biotech", "nasdaq", "tase", "ticker",
-    "pps", "price target", "warrant", "offering", "earnings", "short",
-    "tolmar", "keytruda", "pembro", "pembrolizumab", "gbm", "glioblastoma",
-    "cscc", "head and neck", "pancreatic", "ahns", "sno", "asco", "fda",
-    "ide", "pma", "breakthrough", "restart", "regain", "acapella",
-    "impact trial", "admire", "brachytherapy", "radiation", "tau", "dart",
-    "barclays", "insider", "form 4", "10b5-1", "index", "ta-90", "ta-125",
-]
-
-# Anything matching "drts" without a context word goes to the daily digest (tier 3)
-
-# Sources. No Stocktwits on purpose.
-REDDIT_QUERIES = [
-    "Alpha Tau",
-    "Alpha DaRT",
+QUERIES = [
     "Alpha Tau Medical",
+    '"Alpha Tau"',
+    "Alpha DaRT",
     "DRTS stock",
     "$DRTS",
+    "Alpha DaRT pembrolizumab",
+    "Alpha DaRT head and neck",
+    "Alpha DaRT glioblastoma",
+    "Alpha DaRT pancreatic",
+    "Alpha DaRT skin cancer",
+    "Alpha Tau Tolmar",
+    "Alpha Tau FDA",
+    "Alpha Tau Medical Nasdaq",
+    "Alpha Tau Medical TASE",
 ]
-# (query, hl, gl, ceid)
-GOOGLE_NEWS_QUERIES = [
-    ("Alpha Tau Medical", "en-US", "US", "US:en"),
-    ("Alpha DaRT", "en-US", "US", "US:en"),
-    ("DRTS Alpha Tau", "en-US", "US", "US:en"),
-    ("אלפא טאו", "he", "IL", "IL:he"),
-]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; drts-monitor/1.0)"}
-TIMEOUT = 25
+KEEP_ICASE = re.compile(
+    r"alpha[\s\-]?tau|alpha[\s\-]?dart|\$drts", re.I
+)
+KEEP_CASE = re.compile(r"\bDRTS\b")
 
 
-# ------------------------------------------------------------------
-# STATE HELPERS
-# ------------------------------------------------------------------
-def load_json(name, default):
-    path = os.path.join(STATE_DIR, name)
-    if os.path.exists(path):
+def relevant(text):
+    return bool(KEEP_ICASE.search(text) or KEEP_CASE.search(text))
+
+
+def get(url, retries=0, **kw):
+    for attempt in range(retries + 1):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-
-def save_json(name, data):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(os.path.join(STATE_DIR, name), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def struct_to_dt(t):
-    if not t:
-        return None
-    return datetime(*t[:6], tzinfo=timezone.utc)
-
-
-# ------------------------------------------------------------------
-# TELEGRAM
-# ------------------------------------------------------------------
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
-    for chunk in chunks:
-        try:
-            r = requests.post(
-                url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "text": chunk,
-                    "disable_web_page_preview": "true",
-                },
-                timeout=TIMEOUT,
-            )
-            if r.status_code != 200:
-                print("Telegram error:", r.status_code, r.text[:200])
+            r = requests.get(url, headers=HEADERS, timeout=25, **kw)
+            if r.status_code == 429 and attempt < retries:
+                time.sleep(12)
+                continue
+            r.raise_for_status()
+            return r
         except Exception as e:
-            print("Telegram exception:", e)
-        time.sleep(1)
-
-
-# ------------------------------------------------------------------
-# SOURCES
-# Each fetcher returns a list of dicts:
-# {id, source, title, text, url, published}
-# ------------------------------------------------------------------
-def fetch_reddit(query):
-    url = f"https://www.reddit.com/search.rss?q={quote_plus(query)}&sort=new&t=week"
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Reddit HTTP {r.status_code}")
-    feed = feedparser.parse(r.content)
-    items = []
-    for e in feed.entries:
-        items.append({
-            "id": "reddit:" + (e.get("id") or e.get("link", "")),
-            "source": "Reddit",
-            "title": e.get("title", ""),
-            "text": (e.get("title", "") + " " + e.get("summary", "")),
-            "url": e.get("link", ""),
-            "published": struct_to_dt(e.get("updated_parsed") or e.get("published_parsed")),
-        })
-    return items
-
-
-def fetch_google_news(query, hl, gl, ceid):
-    url = (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(query)
-        + f"&hl={hl}&gl={gl}&ceid={ceid}"
-    )
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Google News HTTP {r.status_code}")
-    feed = feedparser.parse(r.content)
-    items = []
-    for e in feed.entries:
-        items.append({
-            "id": "gnews:" + (e.get("id") or e.get("link", "")),
-            "source": "News",
-            "title": e.get("title", ""),
-            "text": (e.get("title", "") + " " + e.get("summary", "")),
-            "url": e.get("link", ""),
-            "published": struct_to_dt(e.get("published_parsed")),
-        })
-    return items
-
-
-# ------------------------------------------------------------------
-# CLASSIFICATION
-# ------------------------------------------------------------------
-def classify(text):
-    t = text.lower()
-    for n in NOISE_PHRASES:
-        t = t.replace(n, " ")
-    for p in TIER1_PATTERNS:
-        if re.search(p, t):
-            return 1
-    if DRTS_BARE.search(t):
-        if any(c in t for c in CONTEXT_WORDS):
-            return 2
-        return 3
+            if attempt == retries:
+                print(f"fetch failed: {url[:90]} -> {e}", file=sys.stderr)
     return None
 
 
-# ------------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------------
-def fresh_stats():
-    return {"checked": 0, "instant": 0, "digest": 0, "errors": {}}
+def parse_rss(xml_text, source):
+    items = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        desc = re.sub(r"<[^>]+>", " ", it.findtext("description") or "")
+        pub = it.findtext("pubDate")
+        try:
+            when = parsedate_to_datetime(pub) if pub else None
+            if when and when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+        except Exception:
+            when = None
+        items.append(
+            {"title": title, "link": link, "text": f"{title} {desc}",
+             "when": when, "source": source}
+        )
+    return items
+
+
+def google_news(q):
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(f"{q} when:7d")
+           + "&hl=en-US&gl=US&ceid=US:en")
+    r = get(url)
+    return parse_rss(r.text, "Google News") if r else []
+
+
+def bing_news(q):
+    url = ("https://www.bing.com/news/search?q="
+           + urllib.parse.quote(q) + "&format=rss&qft=interval%3d%228%22")
+    r = get(url)
+    return parse_rss(r.text, "Bing News") if r else []
+
+
+def hacker_news(q):
+    url = ("https://hn.algolia.com/api/v1/search_by_date?tags=story&query="
+           + urllib.parse.quote(q))
+    r = get(url)
+    out = []
+    if not r:
+        return out
+    for h in r.json().get("hits", []):
+        title = h.get("title") or ""
+        link = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+        when = None
+        if h.get("created_at_i"):
+            when = datetime.fromtimestamp(h["created_at_i"], tz=timezone.utc)
+        out.append({"title": title, "link": link, "text": title,
+                    "when": when, "source": "Hacker News"})
+    return out
+
+
+def gdelt():
+    url = ("https://api.gdeltproject.org/api/v2/doc/doc?mode=artlist&format=json"
+           "&maxrecords=75&timespan=3d&query="
+           + urllib.parse.quote('("Alpha Tau" OR "Alpha DaRT")'))
+    r = get(url, retries=2)
+    out = []
+    if not r:
+        return out
+    try:
+        data = r.json()
+    except Exception:
+        return out
+    for a in data.get("articles", []):
+        title = a.get("title") or ""
+        when = None
+        try:
+            when = datetime.strptime(a["seendate"], "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc)
+        except Exception:
+            pass
+        out.append({"title": title, "link": a.get("url", ""), "text": title,
+                    "when": when, "source": "GDELT"})
+    return out
+
+
+def yahoo_ticker(symbol):
+    url = ("https://feeds.finance.yahoo.com/rss/2.0/headline?s="
+           f"{symbol}&region=US&lang=en-US")
+    r = get(url)
+    return parse_rss(r.text, "Yahoo Finance") if r else []
+
+
+def key_for(item):
+    norm = re.sub(r"[^a-z0-9]", "", item["title"].lower())[:90]
+    return hashlib.sha1(norm.encode()).hexdigest()
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if isinstance(data, list):
+        now = time.time()
+        return {str(k): now for k in data}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def save_seen(seen):
+    cutoff = time.time() - 30 * 86400
+    seen = {k: v for k, v in seen.items() if v > cutoff}
+    with open(SEEN_FILE, "w") as f:
+        json.dump(seen, f)
+
+
+def send(item):
+    text = f"{item['title']}\n{item['source']}\n{item['link']}"
+    r = requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text},
+        timeout=25,
+    )
+    if r.status_code == 429:
+        time.sleep(int(r.json().get("parameters", {}).get("retry_after", 5)))
+        return send(item)
+    return r.ok
 
 
 def main():
-    if SEND_TEST:
-        send_telegram("DRTS monitor test: the bot is connected and working.")
+    first_run = not os.path.exists(SEEN_FILE)
+    seen = load_seen()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
-    seen = load_json("seen.json", {})
-    digest = load_json("digest.json", {
-        "items": [],
-        "last_digest_date": "",
-        "stats": fresh_stats(),
-    })
-    stats = digest.setdefault("stats", fresh_stats())
-    for k, v in fresh_stats().items():
-        stats.setdefault(k, v)
+    found = []
+    for q in QUERIES:
+        found += google_news(q)
+        found += bing_news(q)
+        found += hacker_news(q)
+    found += gdelt()
+    found += yahoo_ticker("DRTS")
 
-    now = now_utc()
-    cutoff = now - timedelta(hours=MAX_AGE_HOURS)
-
-    # prune seen ids older than 14 days
-    keep_after = now - timedelta(days=14)
-    seen = {
-        k: v for k, v in seen.items()
-        if datetime.fromisoformat(v) > keep_after
-    }
-
-    # collect from all sources, one failure never stops the others
-    jobs = []
-    for q in REDDIT_QUERIES:
-        jobs.append((f"Reddit [{q}]", lambda q=q: fetch_reddit(q)))
-    for q, hl, gl, ceid in GOOGLE_NEWS_QUERIES:
-        jobs.append((
-            f"News [{q}]",
-            lambda q=q, hl=hl, gl=gl, ceid=ceid: fetch_google_news(q, hl, gl, ceid),
-        ))
-
-    collected = {}
-    for name, fn in jobs:
-        try:
-            for item in fn():
-                collected[item["id"]] = item
-        except Exception as e:
-            print(f"{name} failed: {e}")
-            stats["errors"][name] = stats["errors"].get(name, 0) + 1
-        time.sleep(2)
-
-    instant, to_digest = [], []
-    for item in collected.values():
-        if item["id"] in seen:
+    new = []
+    batch_keys = set()
+    for it in found:
+        if not it["title"] or not it["link"]:
             continue
-        pub = item["published"]
-        if pub and pub < cutoff:
+        if not relevant(it["text"]):
             continue
-        stats["checked"] += 1
-        tier = classify(item["text"])
-        seen[item["id"]] = now.isoformat()
-        if tier in (1, 2):
-            instant.append(item)
-        elif tier == 3:
-            to_digest.append(item)
+        if it["when"] and it["when"] < cutoff:
+            continue
+        k = key_for(it)
+        if k in seen or k in batch_keys:
+            continue
+        batch_keys.add(k)
+        new.append(it)
 
-    # newest first, cap instant alerts, overflow goes to the digest
-    instant.sort(key=lambda i: i["published"] or now, reverse=True)
-    overflow = instant[MAX_INSTANT_PER_RUN:]
-    instant = instant[:MAX_INSTANT_PER_RUN]
-    to_digest.extend(overflow)
+    new.sort(key=lambda i: i["when"] or datetime.now(timezone.utc))
+    print(f"fetched {len(found)}, new relevant {len(new)}")
 
-    for item in instant:
-        msg = f"[DRTS] {item['source']}\n{item['title']}\n{item['url']}"
-        send_telegram(msg)
-        stats["instant"] += 1
+    if first_run:
+        for it in new:
+            seen[key_for(it)] = time.time()
+        save_seen(seen)
+        print("first run: seeded, nothing sent")
+        return
 
-    for item in to_digest:
-        digest["items"].append({
-            "source": item["source"],
-            "title": item["title"][:200],
-            "url": item["url"],
-        })
-        stats["digest"] += 1
-
-    # daily digest plus heartbeat
-    today = now.strftime("%Y-%m-%d")
-    if now.hour >= DIGEST_HOUR_UTC and digest.get("last_digest_date") != today:
-        lines = ["DRTS monitor daily digest"]
-        lines.append(
-            f"Checked {stats['checked']} new items. "
-            f"Sent {stats['instant']} instantly, {stats['digest']} loose matches below."
-        )
-        if stats["errors"]:
-            errs = ", ".join(f"{k} x{v}" for k, v in stats["errors"].items())
-            lines.append(f"Source errors: {errs}")
-        else:
-            lines.append("No source errors.")
-        if digest["items"]:
-            lines.append("")
-            lines.append("Loose matches (bare 'drts' with no stock context):")
-            for it in digest["items"][:40]:
-                lines.append(f"- {it['source']}: {it['title']}\n  {it['url']}")
-        send_telegram("\n".join(lines))
-        digest["items"] = []
-        digest["last_digest_date"] = today
-        digest["stats"] = fresh_stats()
-
-    save_json("seen.json", seen)
-    save_json("digest.json", digest)
-    print(f"Done. instant={len(instant)} digest_added={len(to_digest)}")
+    sent = 0
+    for it in new:
+        if sent >= MAX_ALERTS_PER_RUN:
+            break
+        if send(it):
+            seen[key_for(it)] = time.time()
+            sent += 1
+            time.sleep(1.2)
+    save_seen(seen)
+    print(f"sent {sent}")
 
 
 if __name__ == "__main__":
