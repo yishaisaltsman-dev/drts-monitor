@@ -11,8 +11,10 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TG_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TG_CHAT")
+if not TOKEN or not CHAT_ID:
+    sys.exit("Missing Telegram secrets: set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or TG_TOKEN/TG_CHAT")
 
 SEEN_FILE = "seen.json"
 MAX_AGE_DAYS = 3
